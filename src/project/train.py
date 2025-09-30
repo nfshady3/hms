@@ -6,7 +6,6 @@ from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 
 import time
-import os
 from pathlib import Path
 import multiprocessing
 
@@ -15,7 +14,7 @@ from project.model import CNN  # относительный импорт раб�
 # Настройки
 class Config:
     batch_size = 64
-    epochs = 10
+    epochs = 15
     learning_rate = 0.001
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
