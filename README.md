@@ -15,7 +15,7 @@ handwritten-math-solver
 ## Технологии
 
 *   Python
-*   TensorFlow / Keras
+*   Pytorch / torchvision
 *   OpenCV
 *   NumPy, Pandas
 
