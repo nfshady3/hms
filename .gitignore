@@ -14,6 +14,7 @@ env/
 # data and models
 data/
 models/
+graphics/
 
 # notebooks
 .ipynb_checkpoints/
