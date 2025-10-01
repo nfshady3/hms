@@ -1,26 +1,41 @@
+# src/project/train.py
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torchvision import transforms
+from torchvision.datasets import EMNIST
 import matplotlib.pyplot as plt
 
 import time
 from pathlib import Path
 import multiprocessing
+from PIL import Image
+from torchvision.transforms import functional as TF
 
-from project.model import CNN  # относительный импорт работает, если src помечен как Sources Root
+from project.model import CNN  # работает, если src помечен как Sources Root
 
-# Настройки
 class Config:
     batch_size = 64
-    epochs = 15
+    epochs = 20
     learning_rate = 0.001
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    EMNIST_SPLIT = "balanced"
+    # Поправлять ориентацию EMNIST (обычно нужно): True/False
+    EMNIST_ORIENTATION_FIX = True
+    # Небольшая аугментация (RandomAffine) — включи, если хочешь повысить робастность
+    USE_AUGMENTATION = False
+    # Выбор оптимизатора: "adam" или "sgd"
+    OPTIMIZER = "adam"
+    # Scheduler (StepLR) параметры
+    SCHEDULER_STEP = 10
+    SCHEDULER_GAMMA = 0.1
+
     print(f"Используется устройство: {device}")
+    print(f"EMNIST split: {EMNIST_SPLIT}, orientation_fix={EMNIST_ORIENTATION_FIX}, augmentation={USE_AUGMENTATION}")
+    print(f"Оптимизатор: {OPTIMIZER}")
 
-
-# вычисляем корень репозитория (две папки вверх от этого файла: src/project -> корень)
+# вычисляем корень репозитория (src/project -> корень)
 BASE_DIR = Path(__file__).resolve().parents[2]
 
 DATA_DIR = BASE_DIR / "data"
@@ -36,22 +51,53 @@ GRAPHICS_DIR.mkdir(parents=True, exist_ok=True)
 _cpu_count = multiprocessing.cpu_count() if hasattr(multiprocessing, "cpu_count") else 1
 NUM_WORKERS = min(2, max(0, _cpu_count - 1))  # 0..2
 
-# Функции даталоадеров
+# Вспомогательные функции
+def emnist_orientation_fix_pil(img: Image.Image) -> Image.Image:
+    """
+    Надёжная коррекция ориентации для EMNIST, работающая с PIL Image.
+    Обычно rotate(-90) + hflip даёт нормальную ориентацию.
+    Если результат некорректен — попробуй поменять rotate угол или убрать hflip.
+    """
+    # Поворачиваем -90 градусов и зеркалим по горизонтали
+    img = TF.rotate(img, -90, expand=True)
+    img = TF.hflip(img)
+    return img
+
+
+# DataLoaders (EMNIST)
 def get_data_loaders():
-    transform = transforms.Compose([
+    # Собираем трансформации
+    transforms_list = []
+
+    # Если включена предварительная корректировка, делаем это с PIL
+    if Config.EMNIST_ORIENTATION_FIX:
+        transforms_list.append(transforms.Lambda(lambda img: emnist_orientation_fix_pil(img)))
+
+    # Небольшая аугментация (опционально)
+    if Config.USE_AUGMENTATION:
+        aug = transforms.RandomAffine(degrees=8, translate=(0.06, 0.06))
+        transforms_list.append(transforms.RandomApply([aug], p=0.5))
+
+    # Перевод в тензор и нормализация (та же, что у MNIST)
+    transforms_list.extend([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
 
-    train_dataset = datasets.MNIST(
+    transform = transforms.Compose(transforms_list)
+
+    # Загружаем EMNIST
+    train_dataset = EMNIST(
         root=str(DATA_DIR),
+        split=Config.EMNIST_SPLIT,
         train=True,
         download=True,
         transform=transform
     )
 
-    test_dataset = datasets.MNIST(
+    test_dataset = EMNIST(
         root=str(DATA_DIR),
+        split=Config.EMNIST_SPLIT,
         train=False,
         download=True,
         transform=transform
@@ -73,9 +119,16 @@ def get_data_loaders():
         pin_memory=torch.cuda.is_available()
     )
 
-    return train_loader, test_loader
+    # Получаем число классов (безопасно)
+    try:
+        n_classes = len(train_dataset.classes)
+    except Exception:
+        split_to_classes = {"byclass": 62, "balanced": 47, "bymerge": 47, "letters": 26, "digits": 10, "mnist": 10}
+        n_classes = split_to_classes.get(Config.EMNIST_SPLIT, 47)
 
-# Тренировочная и тестовая функции
+    return train_loader, test_loader, n_classes
+
+# Train / Test
 def train_epoch(model, device, train_loader, optimizer, epoch):
     model.train()
     train_loss = 0.0
@@ -86,10 +139,8 @@ def train_epoch(model, device, train_loader, optimizer, epoch):
         data, target = data.to(device), target.to(device)
 
         optimizer.zero_grad()
-
         output = model(data)
         loss = F.nll_loss(output, target)
-
         loss.backward()
         optimizer.step()
 
@@ -106,7 +157,6 @@ def train_epoch(model, device, train_loader, optimizer, epoch):
 
     avg_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0.0
     accuracy = 100. * correct / total if total > 0 else 0.0
-
     return avg_loss, accuracy
 
 
@@ -119,7 +169,6 @@ def test(model, device, test_loader):
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            # суммируем loss для корректного среднего
             test_loss += F.nll_loss(output, target, reduction='sum').item()
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -130,10 +179,9 @@ def test(model, device, test_loader):
 
     print(f'\nTest set: Average loss: {test_loss_avg:.4f}, '
           f'Accuracy: {correct}/{n_samples} ({accuracy:.2f}%)\n')
-
     return test_loss_avg, accuracy
 
-# Визуализация примеров (сохранение в graphics/)
+# Визуализация примеров
 def visualize_samples(test_loader, model, device, num_samples=10):
     model.eval()
     data_iter = iter(test_loader)
@@ -155,35 +203,45 @@ def visualize_samples(test_loader, model, device, num_samples=10):
         ax.axis('off')
 
     plt.tight_layout()
-    out_path = GRAPHICS_DIR / "mnist_predictions.png"
+    out_path = GRAPHICS_DIR / "emnist_predictions.png"
     plt.savefig(str(out_path), dpi=150, bbox_inches='tight')
     print(f"Сохранены предсказания: {out_path}")
     plt.close()
 
-# Основная логика
 def main():
     cfg = Config()
 
-    print("Загрузка данных MNIST...")
-    train_loader, test_loader = get_data_loaders()
+    print("Загрузка данных EMNIST...")
+    train_loader, test_loader, n_classes = get_data_loaders()
 
     print(f"Размер тренировочного датасета: {len(train_loader.dataset)}")
     print(f"Размер тестового датасета: {len(test_loader.dataset)}")
     print(f"Размер батча: {cfg.batch_size}")
+    print(f"Число классов (из датасета): {n_classes}")
 
     device = cfg.device
 
-    # Создаём модель
-    model = CNN().to(device)
+    # Создаём модель с нужным числом выходов
+    model = CNN(num_classes=n_classes).to(device)
     print(f"\nМодель создана: {model.__class__.__name__}")
     print(f"Количество параметров: {sum(p.numel() for p in model.parameters()):,}")
 
-    optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    # Выбираем оптимизатор
+    if Config.OPTIMIZER.lower() == "sgd":
+        optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9, weight_decay=1e-4)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=1e-5)
+
+    # Scheduler
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=Config.SCHEDULER_STEP, gamma=Config.SCHEDULER_GAMMA)
 
     train_losses = []
     train_accuracies = []
     test_losses = []
     test_accuracies = []
+
+    best_acc = 0.0
+    best_checkpoint = MODEL_DIR / "best_emnist_cnn.pth"
 
     print("\nНачало обучения...")
     start_time = time.time()
@@ -197,6 +255,9 @@ def main():
         # Тестирование
         test_loss, test_acc = test(model, device, test_loader)
 
+        # Scheduler step (после валидации)
+        scheduler.step()
+
         epoch_time = time.time() - epoch_start
 
         train_losses.append(train_loss)
@@ -207,6 +268,26 @@ def main():
         print(f"Эпоха {epoch} завершена за {epoch_time:.2f} секунд")
         print(f"Тренировочная точность: {train_acc:.2f}%")
         print(f"Тестовая точность: {test_acc:.2f}%\n")
+
+        # Сохраняем лучший чекпойнт
+        if test_acc > best_acc:
+            best_acc = test_acc
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch,
+                'train_losses': train_losses,
+                'test_losses': test_losses,
+                'train_accuracies': train_accuracies,
+                'test_accuracies': test_accuracies,
+                'config': {
+                    'batch_size': cfg.batch_size,
+                    'epochs': cfg.epochs,
+                    'learning_rate': cfg.learning_rate,
+                    'emnist_split': cfg.EMNIST_SPLIT
+                }
+            }, str(best_checkpoint))
+            print(f"Новый лучший чекпойнт сохранён: {best_checkpoint} (acc={best_acc:.2f}%)")
 
     total_time = time.time() - start_time
     print(f"Общее время обучения: {total_time:.2f} секунд")
@@ -240,8 +321,8 @@ def main():
     print(f"Сохранён график обучения: {history_path}")
     plt.close()
 
-    # Сохранение модели и метрик в models/
-    save_path = MODEL_DIR / "mnist_cnn_model.pth"
+    # Сохранение финальной модели и метрик в models/
+    final_save = MODEL_DIR / "emnist_cnn_model_final.pth"
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -252,11 +333,12 @@ def main():
         'config': {
             'batch_size': cfg.batch_size,
             'epochs': cfg.epochs,
-            'learning_rate': cfg.learning_rate
+            'learning_rate': cfg.learning_rate,
+            'emnist_split': cfg.EMNIST_SPLIT
         }
-    }, str(save_path))
+    }, str(final_save))
 
-    print(f"Модель сохранена как '{save_path}'")
+    print(f"Финальная модель сохранена как '{final_save}'")
 
     # Финальная статистика
     if test_accuracies:
@@ -264,15 +346,18 @@ def main():
         best_epoch = test_accuracies.index(best_test_acc) + 1
         print(f"\n🏆 Лучшая точность на тесте: {best_test_acc:.2f}% на эпохе {best_epoch}")
 
+
+# -----------------------
 # Функция для загрузки и тестирования сохраненной модели
+# -----------------------
 def load_and_test_model():
     cfg = Config()
 
-    _, test_loader = get_data_loaders()
+    _, test_loader, n_classes = get_data_loaders()
     device = cfg.device
 
-    model = CNN().to(device)
-    save_path = MODEL_DIR / "mnist_cnn_model.pth"
+    model = CNN(num_classes=n_classes).to(device)
+    save_path = MODEL_DIR / "best_emnist_cnn.pth"
 
     if not save_path.exists():
         raise FileNotFoundError(f"Файл модели не найден: {save_path}")
